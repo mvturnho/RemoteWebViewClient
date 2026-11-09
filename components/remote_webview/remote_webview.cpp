@@ -948,7 +948,7 @@ bool RemoteWebView::ws_send_bin_(const uint8_t *data, size_t len, TickType_t loc
   return r == (int)len;
 }
 
-// url_ is written from the main loop (open_url) and read by the WS task on (re)connect.
+// url_ is written from the main loop (open_url, set_url) and read by the WS task on (re)connect.
 // Without the mutex (before setup or if it failed) no tasks are running, so direct access is safe.
 std::string RemoteWebView::get_url_() const {
   if (!state_mtx_) return url_;

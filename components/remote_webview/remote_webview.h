@@ -37,7 +37,8 @@ class RemoteWebView : public Component {
   void set_display(display::Display *d) { display_ = d; }
   void set_touchscreen(touchscreen::Touchscreen *t) { touch_ = t; }
   void set_device_id(const std::string &s) { device_id_ = s; }
-  void set_url(const std::string &s) { url_ = s; }
+  // Safe to call at runtime (e.g. from a YAML lambda): the WS task reads url_ on reconnect.
+  void set_url(const std::string &s) { set_url_(s); }
   void set_server(const std::string &s);
   void set_tile_size(int v) { tile_size_ = v; }
   void set_full_frame_tile_count(int v) { full_frame_tile_count_ = v; }
