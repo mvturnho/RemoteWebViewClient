@@ -724,13 +724,14 @@ void RemoteWebView::process_frame_stats_packet_(const uint8_t *data, size_t len)
 #if REMOTE_WEBVIEW_HW_JPEG
 // Width in pixels of one RGB565 output block written by the P4 JPEG decoder's 2D-DMA, per chroma
 // subsampling (RGB565 column of dec_hb_tbl in ESP-IDF esp_driver_jpeg/jpeg_param.c, the same in
-// IDF 5.5 to 6.1).
-static uint32_t hw_jpeg_min_width(jpeg_down_sampling_type_t sampling) {
+// IDF 5.5 to 6.1). Each is a multiple of 16, so a tile that is a whole number of blocks wide is
+// MCU-aligned as well.
+static uint32_t hw_jpeg_block_width(jpeg_down_sampling_type_t sampling) {
   switch (sampling) {
     case JPEG_DOWN_SAMPLING_YUV444: return 32;
     case JPEG_DOWN_SAMPLING_YUV422: return 64;
     case JPEG_DOWN_SAMPLING_YUV420: return 48;
-    default: return UINT32_MAX;  // grayscale: the hardware can't convert it to RGB565
+    default: return 0;  // grayscale: the hardware can't convert it to RGB565
   }
 }
 #endif
@@ -746,24 +747,21 @@ bool RemoteWebView::decode_jpeg_tile_to_lcd_(int16_t dst_x, int16_t dst_y, uint1
       return decode_jpeg_tile_software_(dst_x, dst_y, data, len);
     }
 
-    // A tile narrower than one 2D-DMA output block doesn't finish in hardware: the decode only
-    // returns at the timeout. The server's 32 px wide 4:2:0 tiles (one tile column) hit this, so
-    // narrow tiles go straight to software; at this size that costs far less than a timeout.
-    if (hdr.width < hw_jpeg_min_width(hdr.sample_method)) {
-      ESP_LOGV(TAG, "HW skipped: %u px wide tile is narrower than one DMA2D block", (unsigned)hdr.width);
+    // The hardware only decodes a tile correctly when its width is a whole number of 2D-DMA output
+    // blocks (seen on ESP32-P4 rev1.3 with the server's 4:2:0 tiles): a narrower tile only returns
+    // at the timeout, and a tile with a partial last block shows grey blocks. Other widths go to
+    // software. tile_size: 48 makes every tile a multiple of the 4:2:0 block width.
+    const uint32_t block_w = hw_jpeg_block_width(hdr.sample_method);
+    if (block_w == 0 || hdr.width % block_w != 0) {
+      ESP_LOGV(TAG, "HW skipped: %u px wide tile is not a whole number of %u px DMA2D blocks",
+               (unsigned)hdr.width, (unsigned)block_w);
       return decode_jpeg_tile_software_(dst_x, dst_y, data, len);
     }
 
-    const int aligned_w = (hdr.width  + 15) & ~15;
+    const int aligned_w = (int)hdr.width;  // whole blocks, so already a multiple of 16
     const int aligned_h = (hdr.height + 15) & ~15;
     const uint32_t out_sz = (uint32_t)aligned_w * (uint32_t)aligned_h * 2u;
 
-    if (aligned_w != (int)hdr.width) {
-      ESP_LOGV(TAG, "HW fallback: jpeg dimensions not aligned: %u x %u", (unsigned)hdr.width, (unsigned)hdr.height);
-      frame_hw_fallback_tiles_++;
-      return decode_jpeg_tile_software_(dst_x, dst_y, data, len);
-    }
-    
     if (len > hw_decode_input_size_ || out_sz > hw_decode_output_size_) {
       ESP_LOGV(TAG, "HW fallback: tile too large for HW decoder buffers");
       frame_hw_fallback_tiles_++;

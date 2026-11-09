@@ -153,6 +153,7 @@ remote_webview:
   # ESP32-P4 only; hardware decoder options are ignored on other targets.
   hw_decode: true
   hw_decode_timeout_ms: 200
+  tile_size: 48  # ESP32-P4: every tile width is then decoded in hardware (see hw_decode below)
   # Temporary P4 timeout diagnostics; leave disabled during normal use.
   # hw_decode_diagnostics: true
   # hw_decode_driver_debug: true
@@ -188,7 +189,7 @@ text:
 | `server`                | string    | ✅       | `172.16.0.252:8081`              | WebSocket server address. Must be `hostname_or_IP:port`. |
 | `url`                   | string    | ✅       | `http://…/dashboard`             | Page to open on connect. |
 | `device_id`             | string    | ❌       | `"my-device"` or auto (`esp32-<mac>`) | Identifier used by the server. If not set, the component derives `esp32-<mac>` from the chip MAC and still sends it. |
-| `tile_size`             | int       | ❌       | `32`                              | Tile edge size in pixels. Helps the server choose tile packing; it’s best to keep it a multiple of 16. |
+| `tile_size`             | int       | ❌       | `32`                              | Tile edge size in pixels. Helps the server choose tile packing; it’s best to keep it a multiple of 16. On ESP32-P4 with `hw_decode`, use `48`. |
 | `full_frame_tile_count` | int       | ❌       | `4`                               | Number of tiles the server should use for full-frame updates. |
 | `full_frame_area_threshold` | float | ❌       | `0.50`                            | Area delta (fraction of screen) above which the server should send a full frame. |
 | `full_frame_every`      | int       | ❌       | `50`                              | Force a full-frame update every N frames (0 disables). |
@@ -217,7 +218,7 @@ text:
 - **max_bytes_per_msg** should be larger than your maximum tile size (full-frame or partial).
 - **jpeg_quality** — lower values encode faster and reduce bandwidth (but increase artifacts). Start at **85**, drop toward **70–75** if you need speed.
 - **big_endian** — defaults to **false** on ESP32-P4 so hardware and software-fallback tiles use the same little-endian MIPI-DSI representation. Other targets retain the previous **true** default.
-- **hw_decode** — ESP32-P4 only; defaults to **true**. Set to `false` to use the software JPEG decoder. Tiles narrower than one output block of the hardware decoder's 2D-DMA (48 px for the server's 4:2:0 JPEGs, 64 px for 4:2:2, 32 px for 4:4:4) are always decoded in software, because in hardware they time out after `hw_decode_timeout_ms` instead of finishing. With the default `tile_size: 32`, a changed region one tile wide is such a tile.
+- **hw_decode** — ESP32-P4 only; defaults to **true**. Set to `false` to use the software JPEG decoder. Only tiles whose width is a whole number of the hardware decoder's 2D-DMA output blocks (48 px for the server's 4:2:0 JPEGs, 64 px for 4:2:2, 32 px for 4:4:4) are decoded in hardware. Other tiles are decoded in software, because in hardware a narrower tile times out after `hw_decode_timeout_ms` and a tile with a partial last block shows grey blocks. Set `tile_size: 48` so every tile qualifies; with the default `32`, only tiles 96, 192, 288, … px wide do.
 - **hw_decode_timeout_ms** — ESP32-P4 only; defaults to **200**. Timeout passed to the hardware JPEG decoder engine.
 - **Hardware JPEG diagnostics** — enable `hw_decode_diagnostics` for timeout metadata. Add `hw_decode_driver_debug` only for a short diagnostic run and use DEBUG logging; a `jpeg.decoder: 2ddma transaction callbacks start` line proves that DMA2D picked up the transaction. The IDF driver warns that this debug mode makes JPEG processing substantially slower.
 - **Display ownership** — `remote_webview` draws from its own task, so nothing else may draw to the same display: use `update_interval: never`, no `lambda`/`pages`, `auto_clear_enabled: false`, `show_test_card: false`, and don't call `component.update` on it. Prefer a touchscreen on a separate bus (e.g. I2C) rather than sharing the display's SPI bus.
