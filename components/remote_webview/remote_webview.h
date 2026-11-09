@@ -7,6 +7,7 @@
 #include "JPEGDEC.h"
 #include "protocol.h"
 #include "remote_webview_config.h"
+#include "rgb565_contract.h"
 
 #include "esp_event.h"
 #include "esp_websocket_client.h"
@@ -49,6 +50,7 @@ class RemoteWebView : public Component {
   void set_big_endian(bool v) { rgb565_big_endian_ = v; }
   void set_hw_decode(bool v) { hw_decode_ = v; }
   void set_hw_decode_timeout_ms(int v) { hw_decode_timeout_ms_ = v; }
+  void set_hw_decode_diagnostics(bool v) { hw_decode_diagnostics_ = v; }
   void set_stats_interval(uint32_t ms) { stats_interval_ms_ = ms; }
   void set_rotation(int v) { rotation_ = v; }
   void set_scale(float v) { scale_ = v; }
@@ -116,9 +118,14 @@ class RemoteWebView : public Component {
   int min_frame_interval_{-1};
   int jpeg_quality_{-1};
   int max_bytes_per_msg_{-1};
+#if REMOTE_WEBVIEW_HW_JPEG
+  bool rgb565_big_endian_{rgb565::P4_SOFTWARE_JPEG_BIG_ENDIAN};
+#else
   bool rgb565_big_endian_{true};
+#endif
   bool hw_decode_{true};
   int hw_decode_timeout_ms_{200};
+  bool hw_decode_diagnostics_{false};
   int rotation_{0};
   float scale_{-1.0f};
   bool touch_disabled_{false};
@@ -129,6 +136,8 @@ class RemoteWebView : public Component {
   uint8_t *hw_decode_output_buf_{nullptr};
   size_t hw_decode_input_size_{0};
   size_t hw_decode_output_size_{0};
+  uint32_t hw_decode_successes_{0};
+  uint32_t hw_decode_timeouts_{0};
 #endif
 
   std::atomic<int64_t> last_keepalive_us_{0};  // WS client task + rwv_ws
@@ -214,7 +223,8 @@ class RemoteWebView : public Component {
   void process_packet_(void *client, const uint8_t *data, size_t len);
   void process_frame_packet_(const uint8_t *data, size_t len);
   void process_frame_stats_packet_(const uint8_t *data, size_t len);
-  bool decode_jpeg_tile_to_lcd_(int16_t dst_x, int16_t dst_y, const uint8_t *data, size_t len);
+  bool decode_jpeg_tile_to_lcd_(int16_t dst_x, int16_t dst_y, uint16_t tile_width,
+                                uint16_t tile_height, const uint8_t *data, size_t len);
   bool decode_jpeg_tile_software_(int16_t dst_x, int16_t dst_y, const uint8_t *data, size_t len);
 
   static int jpeg_draw_cb_s_(JPEGDRAW *p);
@@ -222,10 +232,11 @@ class RemoteWebView : public Component {
   // Draws a w×h RGB565 region whose source rows are `stride` pixels apart, clipped to
   // [0, clip_x1) × [0, clip_y1).
   void draw_rgb565_clipped_(int x, int y, int w, int h, int stride, const uint8_t *pixels,
-                            int clip_x1, int clip_y1);
+                            int clip_x1, int clip_y1, bool big_endian);
   JPEGDEC jd_;
   int sw_clip_x1_{0};  // clip bounds of the tile being decoded in software (decode task only)
   int sw_clip_y1_{0};
+  bool sw_rgb565_big_endian_{true};
 
   bool ws_send_touch_event_(proto::TouchType type, int x, int y, uint8_t pid);
   bool ws_send_keepalive_();

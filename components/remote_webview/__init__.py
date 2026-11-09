@@ -24,6 +24,8 @@ CONF_MAX_BYTES_PER_MSG = "max_bytes_per_msg"
 CONF_BIG_ENDIAN = "big_endian"
 CONF_HW_DECODE = "hw_decode"
 CONF_HW_DECODE_TIMEOUT_MS = "hw_decode_timeout_ms"
+CONF_HW_DECODE_DIAGNOSTICS = "hw_decode_diagnostics"
+CONF_HW_DECODE_DRIVER_DEBUG = "hw_decode_driver_debug"
 CONF_STATS_INTERVAL = "stats_interval"
 CONF_SCALE = "scale"
 
@@ -82,6 +84,8 @@ CONFIG_SCHEMA = cv.Schema(
         cv.Optional(CONF_BIG_ENDIAN): cv.boolean,
         cv.Optional(CONF_HW_DECODE): cv.boolean,
         cv.Optional(CONF_HW_DECODE_TIMEOUT_MS): cv.positive_int,
+        cv.Optional(CONF_HW_DECODE_DIAGNOSTICS, default=False): cv.boolean,
+        cv.Optional(CONF_HW_DECODE_DRIVER_DEBUG, default=False): cv.boolean,
         cv.Optional(CONF_STATS_INTERVAL): cv.positive_time_period_milliseconds,
         cv.Optional(CONF_ROTATION): validate_rotation,
         cv.Optional(CONF_SCALE): cv.float_range(min=0.5, max=4.0),
@@ -155,6 +159,14 @@ async def to_code(config):
         cg.add(var.set_hw_decode(config[CONF_HW_DECODE]))
     if CONF_HW_DECODE_TIMEOUT_MS in config:
         cg.add(var.set_hw_decode_timeout_ms(config[CONF_HW_DECODE_TIMEOUT_MS]))
+    driver_debug = config[CONF_HW_DECODE_DRIVER_DEBUG]
+    cg.add(
+        var.set_hw_decode_diagnostics(
+            config[CONF_HW_DECODE_DIAGNOSTICS] or driver_debug
+        )
+    )
+    if driver_debug and esp32.get_esp32_variant() == esp32.VARIANT_ESP32P4:
+        add_idf_sdkconfig_option("CONFIG_JPEG_ENABLE_DEBUG_LOG", True)
     if CONF_STATS_INTERVAL in config:
         cg.add(var.set_stats_interval(config[CONF_STATS_INTERVAL].total_milliseconds))
     if CONF_ROTATION in config:

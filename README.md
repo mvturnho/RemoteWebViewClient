@@ -150,9 +150,12 @@ remote_webview:
   full_frame_tile_count: 1
   max_bytes_per_msg: 61440
   jpeg_quality: 85
-  # ESP32-P4 only; both options are ignored on other targets.
+  # ESP32-P4 only; hardware decoder options are ignored on other targets.
   hw_decode: true
   hw_decode_timeout_ms: 200
+  # Temporary P4 timeout diagnostics; leave disabled during normal use.
+  # hw_decode_diagnostics: true
+  # hw_decode_driver_debug: true
   
   on_frame_update:
     - logger.log: "The display just received a frame update!"
@@ -193,7 +196,11 @@ text:
 | `min_frame_interval`    | int (ms)  | ❌       | `80`                              | Minimum time between frames on the wire, in milliseconds. |
 | `jpeg_quality`          | int       | ❌       | `85`                              | JPEG quality hint for the server’s encoder. |
 | `max_bytes_per_msg`     | int (B)   | ❌       | `14336` or `61440`                | Upper bound for a single WS binary message. |
-| `big_endian`            | bool      | ❌       | `true` or `false`                 | Use big-endian RGB565 pixel order for JPEG output (set false for little-endian panels). Default is `true`. |
+| `big_endian`            | bool      | ❌       | `true` or `false`                 | RGB565 pixel byte order for software JPEG output. Defaults to `false` on ESP32-P4 and `true` on other targets. P4 hardware fallback always stays little-endian to match the hardware decoder. |
+| `hw_decode`             | bool      | ❌       | `true`                            | ESP32-P4 only. Use the hardware JPEG decoder; defaults to `true`. |
+| `hw_decode_timeout_ms`  | int (ms)  | ❌       | `200`                             | ESP32-P4 only. Hardware JPEG decoder timeout. |
+| `hw_decode_diagnostics` | bool      | ❌       | `false`                           | Log firmware/chip versions and detailed metadata plus CRC32 when a P4 hardware decode times out. |
+| `hw_decode_driver_debug` | bool     | ❌       | `false`                           | Enable `CONFIG_JPEG_ENABLE_DEBUG_LOG` to show whether DMA2D starts a JPEG transaction. Diagnostic only; significantly slows JPEG processing. |
 | `rotation`              | int       | ❌       | 0, 90, 180, 270                   | Enables software rotation for both the display and touchscreen. |
 | `scale`                 | float     | ❌       | `1.5`                             | Page zoom (0.5–4). The page is laid out at the display size divided by the scale and rendered at that device scale factor, so text and controls get bigger. For sharp output the server needs `MAX_DEVICE_SCALE_FACTOR` at least this value. |
 | `on_frame_update`       | action    | ❌       | `- logger.log: "The display just received a frame update!"`  | Action that gets triggered each time the display updates (maximum of 1 trigger per second) |
@@ -209,9 +216,10 @@ text:
 - **min_frame_interval** caps how often the server sends frames. It protects the device from frames arriving faster than it can decode them (e.g. while scrolling), so it should be at least the device's decode time for a full-screen frame. Run the self-test (`url: "self-test"`): it measures that time and recommends a value.
 - **max_bytes_per_msg** should be larger than your maximum tile size (full-frame or partial).
 - **jpeg_quality** — lower values encode faster and reduce bandwidth (but increase artifacts). Start at **85**, drop toward **70–75** if you need speed.
-- **big_endian** — defaults to **true**. If colors look wrong (swapped/tinted), set `big_endian: false` for panels that require little-endian RGB565.
+- **big_endian** — defaults to **false** on ESP32-P4 so hardware and software-fallback tiles use the same little-endian MIPI-DSI representation. Other targets retain the previous **true** default.
 - **hw_decode** — ESP32-P4 only; defaults to **true**. Set to `false` to use the software JPEG decoder.
 - **hw_decode_timeout_ms** — ESP32-P4 only; defaults to **200**. Timeout passed to the hardware JPEG decoder engine.
+- **Hardware JPEG diagnostics** — enable `hw_decode_diagnostics` for timeout metadata. Add `hw_decode_driver_debug` only for a short diagnostic run and use DEBUG logging; a `jpeg.decoder: 2ddma transaction callbacks start` line proves that DMA2D picked up the transaction. The IDF driver warns that this debug mode makes JPEG processing substantially slower.
 - **Display ownership** — `remote_webview` draws from its own task, so nothing else may draw to the same display: use `update_interval: never`, no `lambda`/`pages`, `auto_clear_enabled: false`, `show_test_card: false`, and don't call `component.update` on it. Prefer a touchscreen on a separate bus (e.g. I2C) rather than sharing the display's SPI bus.
 - **Red tile / red screen** — this indicates a tile payload exceeded `max_bytes_per_msg`. Increase `max_bytes_per_msg` or reduce tile size/JPEG quality so each tile fits.
 

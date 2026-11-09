@@ -1,7 +1,10 @@
 #include "remote_webview.h"
 #include "remote_webview_config.h"
 #include "esphome/core/log.h"
+#include "esphome/core/version.h"
 
+#include "esp_chip_info.h"
+#include "esp_crc.h"
 #include "esp_idf_version.h"
 #include "esp_event.h"
 #include "esp_mac.h"
@@ -14,6 +17,7 @@
 #include "freertos/task.h"
 
 #include <algorithm>
+#include <inttypes.h>
 
 namespace esphome {
 namespace remote_webview {
@@ -70,6 +74,25 @@ void RemoteWebView::setup() {
 
   display_width_ = display_->get_width();
   display_height_ = display_->get_height();
+
+#if REMOTE_WEBVIEW_HW_JPEG
+  if (this->hw_decode_diagnostics_) {
+    esp_chip_info_t chip_info{};
+    esp_chip_info(&chip_info);
+    ESP_LOGI(TAG, "HW JPEG diagnostics: ESPHome %s, ESP-IDF %s, ESP32-P4 rev v%u.%u",
+             ESPHOME_VERSION, esp_get_idf_version(), (unsigned) (chip_info.revision / 100),
+             (unsigned) (chip_info.revision % 100));
+#if defined(CONFIG_JPEG_ENABLE_DEBUG_LOG) && CONFIG_JPEG_ENABLE_DEBUG_LOG
+    ESP_LOGI(TAG, "JPEG driver debug enabled; look for '2ddma transaction callbacks start' before a timeout");
+#else
+    ESP_LOGW(TAG, "JPEG driver debug is disabled; set hw_decode_driver_debug: true to trace DMA2D start");
+#endif
+  }
+#if ESP_IDF_VERSION < ESP_IDF_VERSION_VAL(5, 5, 6)
+  ESP_LOGW(TAG, "ESP-IDF %s is older than 5.5.6; update it before evaluating JPEG timeout recovery",
+           esp_get_idf_version());
+#endif
+#endif
 
   q_decode_ = xQueueCreate(cfg::decode_queue_depth, sizeof(WsMsg));
   ws_send_mtx_ = xSemaphoreCreateMutex();
@@ -167,6 +190,8 @@ void RemoteWebView::dump_config() {
   ESP_LOGCONFIG(TAG, "  hw_decode: %s", this->hw_decode_ ? "true" : "false");
   if (this->hw_decode_)
     ESP_LOGCONFIG(TAG, "  hw_decode_timeout_ms: %d", this->hw_decode_timeout_ms_);
+  ESP_LOGCONFIG(TAG, "  hw_decode_diagnostics: %s", YESNO(this->hw_decode_diagnostics_));
+  ESP_LOGCONFIG(TAG, "  jpeg_rgb565_byte_order: little-endian");
   ESP_LOGCONFIG(TAG, "  hw_jpeg_available: %s", hw_dec_ ? "yes" : "no");
 #else
   ESP_LOGCONFIG(TAG, "  hw_jpeg: no");
@@ -579,7 +604,8 @@ void RemoteWebView::process_frame_packet_(const uint8_t *data, size_t len)
     if (ok) {
       const int64_t t0 = esp_timer_get_time();
       const uint32_t draw0 = ft_draw_us_;
-      ok = decode_jpeg_tile_to_lcd_((int16_t)th.x, (int16_t)th.y, data + off, th.dlen);
+      ok = decode_jpeg_tile_to_lcd_((int16_t)th.x, (int16_t)th.y, th.w, th.h,
+                                    data + off, th.dlen);
       ft_decode_us_ += (uint32_t)(esp_timer_get_time() - t0) - (ft_draw_us_ - draw0);
     }
     if (!ok) failed++;
@@ -695,7 +721,8 @@ void RemoteWebView::process_frame_stats_packet_(const uint8_t *data, size_t len)
   ws_send_bin_(pkt, n, pdMS_TO_TICKS(50), pdMS_TO_TICKS(50));
 }
 
-bool RemoteWebView::decode_jpeg_tile_to_lcd_(int16_t dst_x, int16_t dst_y, const uint8_t *data, size_t len) {
+bool RemoteWebView::decode_jpeg_tile_to_lcd_(int16_t dst_x, int16_t dst_y, uint16_t tile_width,
+                                             uint16_t tile_height, const uint8_t *data, size_t len) {
   if (!data || !len) return false;
 
 #if REMOTE_WEBVIEW_HW_JPEG
@@ -724,13 +751,30 @@ bool RemoteWebView::decode_jpeg_tile_to_lcd_(int16_t dst_x, int16_t dst_y, const
     jpeg_decode_cfg_t jcfg{};
     jcfg.output_format = JPEG_DECODE_OUT_FORMAT_RGB565;
     jcfg.rgb_order     = JPEG_DEC_RGB_ELEMENT_ORDER_BGR;
-    jcfg.conv_std      = JPEG_YUV_RGB_CONV_STD_BT709;
+    jcfg.conv_std      = JPEG_YUV_RGB_CONV_STD_BT601;
 
     memcpy(hw_decode_input_buf_, data, len);
     
     uint32_t written = 0;
+    const int64_t decode_start_us = this->hw_decode_diagnostics_ ? esp_timer_get_time() : 0;
     esp_err_t dr = jpeg_decoder_process(hw_dec_, &jcfg, hw_decode_input_buf_, (uint32_t)len, 
                                         hw_decode_output_buf_, out_sz, &written);
+
+    if (dr == ESP_ERR_TIMEOUT) {
+      if (this->hw_decode_diagnostics_) {
+        const uint32_t duration_ms = (uint32_t) ((esp_timer_get_time() - decode_start_us) / 1000);
+        const uint32_t crc32 = esp_crc32_le(0, data, len);
+        ESP_LOGW(TAG,
+                 "HW JPEG timeout: input=%u tile=%ux%u jpeg=%ux%u crc32=%08" PRIx32
+                 " output=%u/%u duration=%u ms error=%s (0x%08" PRIx32
+                 ") prior_successes=%u prior_timeouts=%u",
+                 (unsigned) len, (unsigned) tile_width, (unsigned) tile_height,
+                 (unsigned) hdr.width, (unsigned) hdr.height, crc32, (unsigned) written,
+                 (unsigned) out_sz, (unsigned) duration_ms, esp_err_to_name(dr), (uint32_t) dr,
+                 (unsigned) this->hw_decode_successes_, (unsigned) this->hw_decode_timeouts_);
+      }
+      this->hw_decode_timeouts_++;
+    }
 
     if (dr != ESP_OK) {
       ESP_LOGV(TAG, "HW fallback: decode failed: %s", esp_err_to_name(dr));
@@ -746,9 +790,11 @@ bool RemoteWebView::decode_jpeg_tile_to_lcd_(int16_t dst_x, int16_t dst_y, const
       return decode_jpeg_tile_software_(dst_x, dst_y, data, len);
     }
 
+    this->hw_decode_successes_++;
     draw_rgb565_clipped_(dst_x, dst_y, (int)hdr.width, (int)hdr.height, aligned_w, hw_decode_output_buf_,
                          std::min<int>(dst_x + (int)hdr.width, display_width_),
-                         std::min<int>(dst_y + (int)hdr.height, display_height_));
+                         std::min<int>(dst_y + (int)hdr.height, display_height_),
+                         rgb565::P4_HARDWARE_JPEG_BIG_ENDIAN);
 
     return true;
   }
@@ -764,7 +810,12 @@ bool RemoteWebView::decode_jpeg_tile_software_(int16_t dst_x, int16_t dst_y, con
   }
 
   jd_.setMaxOutputSize(8 * 2048);
-  jd_.setPixelType(rgb565_big_endian_ ? RGB565_BIG_ENDIAN : RGB565_LITTLE_ENDIAN);
+#if REMOTE_WEBVIEW_HW_JPEG
+  sw_rgb565_big_endian_ = this->hw_decode_ ? rgb565::P4_SOFTWARE_JPEG_BIG_ENDIAN : rgb565_big_endian_;
+#else
+  sw_rgb565_big_endian_ = rgb565_big_endian_;
+#endif
+  jd_.setPixelType(sw_rgb565_big_endian_ ? RGB565_BIG_ENDIAN : RGB565_LITTLE_ENDIAN);
 
   // Blocks are MCU-aligned and may extend past the image; clip them to the tile and the display.
   sw_clip_x1_ = std::min<int>(dst_x + jd_.getWidth(), display_width_);
@@ -787,12 +838,12 @@ int RemoteWebView::jpeg_draw_cb_s_(JPEGDRAW *p) {
 int RemoteWebView::jpeg_draw_cb_(JPEGDRAW *p) {
   // Rows in pPixels are p->iWidth pixels apart, even when only part of the block is drawn.
   draw_rgb565_clipped_(p->x, p->y, p->iWidth, p->iHeight, p->iWidth, (const uint8_t *)p->pPixels,
-                       sw_clip_x1_, sw_clip_y1_);
+                       sw_clip_x1_, sw_clip_y1_, sw_rgb565_big_endian_);
   return 1;
 }
 
 void RemoteWebView::draw_rgb565_clipped_(int x, int y, int w, int h, int stride, const uint8_t *pixels,
-                                         int clip_x1, int clip_y1) {
+                                         int clip_x1, int clip_y1, bool big_endian) {
   int x_off = 0, y_off = 0;
   if (x < 0) { x_off = -x; w += x; x = 0; }
   if (y < 0) { y_off = -y; h += y; y = 0; }
@@ -804,7 +855,7 @@ void RemoteWebView::draw_rgb565_clipped_(int x, int y, int w, int h, int stride,
   display_->draw_pixels_at(x, y, w, h, pixels,
                            esphome::display::COLOR_ORDER_RGB,
                            esphome::display::COLOR_BITNESS_565,
-                           rgb565_big_endian_,
+                           big_endian,
                            x_off, y_off, stride - x_off - w);
   ft_draw_us_ += (uint32_t)(esp_timer_get_time() - t0);
 }
