@@ -721,6 +721,20 @@ void RemoteWebView::process_frame_stats_packet_(const uint8_t *data, size_t len)
   ws_send_bin_(pkt, n, pdMS_TO_TICKS(50), pdMS_TO_TICKS(50));
 }
 
+#if REMOTE_WEBVIEW_HW_JPEG
+// Width in pixels of one RGB565 output block written by the P4 JPEG decoder's 2D-DMA, per chroma
+// subsampling (RGB565 column of dec_hb_tbl in ESP-IDF esp_driver_jpeg/jpeg_param.c, the same in
+// IDF 5.5 to 6.1).
+static uint32_t hw_jpeg_min_width(jpeg_down_sampling_type_t sampling) {
+  switch (sampling) {
+    case JPEG_DOWN_SAMPLING_YUV444: return 32;
+    case JPEG_DOWN_SAMPLING_YUV422: return 64;
+    case JPEG_DOWN_SAMPLING_YUV420: return 48;
+    default: return UINT32_MAX;  // grayscale: the hardware can't convert it to RGB565
+  }
+}
+#endif
+
 bool RemoteWebView::decode_jpeg_tile_to_lcd_(int16_t dst_x, int16_t dst_y, uint16_t tile_width,
                                              uint16_t tile_height, const uint8_t *data, size_t len) {
   if (!data || !len) return false;
@@ -729,6 +743,14 @@ bool RemoteWebView::decode_jpeg_tile_to_lcd_(int16_t dst_x, int16_t dst_y, uint1
   if (hw_dec_ && hw_decode_input_buf_ && hw_decode_output_buf_) {
     jpeg_decode_picture_info_t hdr{};
     if (jpeg_decoder_get_info(data, (uint32_t)len, &hdr) != ESP_OK || !hdr.width || !hdr.height) {
+      return decode_jpeg_tile_software_(dst_x, dst_y, data, len);
+    }
+
+    // A tile narrower than one 2D-DMA output block doesn't finish in hardware: the decode only
+    // returns at the timeout. The server's 32 px wide 4:2:0 tiles (one tile column) hit this, so
+    // narrow tiles go straight to software; at this size that costs far less than a timeout.
+    if (hdr.width < hw_jpeg_min_width(hdr.sample_method)) {
+      ESP_LOGV(TAG, "HW skipped: %u px wide tile is narrower than one DMA2D block", (unsigned)hdr.width);
       return decode_jpeg_tile_software_(dst_x, dst_y, data, len);
     }
 
