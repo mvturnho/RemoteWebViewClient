@@ -298,8 +298,12 @@ void RemoteWebView::ws_task_tramp_(void *arg) {
         }
       }
 
+      // A hidden overlay is requested right away; if that request gets no complete full frame,
+      // the screen stays out of sync and the regular interval retries it.
+      const bool now_wanted = self->full_frame_now_.exchange(false);
       if (self->screen_out_of_sync_() &&
-          now_us - self->last_full_frame_req_us_.load() >= cfg::full_frame_request_interval_us) {
+          (now_wanted ||
+           now_us - self->last_full_frame_req_us_.load() >= cfg::full_frame_request_interval_us)) {
         if (self->ws_send_request_full_frame_()) {
           self->last_full_frame_req_us_.store(now_us);
           self->full_frame_reqs_.fetch_add(1);
@@ -327,6 +331,7 @@ void RemoteWebView::ws_event_handler_(void *handler_arg, esp_event_base_t, int32
         self_->last_keepalive_us_.store(esp_timer_get_time());
         // The server sends a full frame on connect; don't request another one right away.
         self_->last_full_frame_req_us_.store(esp_timer_get_time());
+        self_->full_frame_now_.store(false);
         const std::string url = self_->get_url_();
         if (!url.empty())
           self_->ws_send_open_url_(url.c_str(), 0);
@@ -447,7 +452,10 @@ void RemoteWebView::decode_task_tramp_(void *arg) {
   // With stats enabled, wake up periodically so a window is reported even when idle.
   const TickType_t wait = self->stats_interval_ms_ ? pdMS_TO_TICKS(self->stats_interval_ms_) : portMAX_DELAY;
   for (;;) {
-    if (xQueueReceive(self->q_decode_, &m, wait) == pdTRUE) {
+    const bool got = xQueueReceive(self->q_decode_, &m, wait) == pdTRUE;
+    self->apply_overlay_request_();
+    // A message without a buffer only wakes the task for an overlay request.
+    if (got && m.buf) {
       self->msg_loss_seq_ = m.rx_loss_seq;
       self->msg_rx_start_us_ = m.rx_start_us;
       self->msg_enqueue_us_ = m.enqueue_us;
@@ -830,11 +838,7 @@ bool RemoteWebView::decode_jpeg_tile_software_(int16_t dst_x, int16_t dst_y, con
   }
 
   jd_.setMaxOutputSize(8 * 2048);
-#if REMOTE_WEBVIEW_HW_JPEG
-  sw_rgb565_big_endian_ = this->hw_decode_ ? rgb565::P4_SOFTWARE_JPEG_BIG_ENDIAN : rgb565_big_endian_;
-#else
-  sw_rgb565_big_endian_ = rgb565_big_endian_;
-#endif
+  sw_rgb565_big_endian_ = panel_big_endian_();
   jd_.setPixelType(sw_rgb565_big_endian_ ? RGB565_BIG_ENDIAN : RGB565_LITTLE_ENDIAN);
 
   // Blocks are MCU-aligned and may extend past the image; clip them to the tile and the display.
@@ -864,20 +868,225 @@ int RemoteWebView::jpeg_draw_cb_(JPEGDRAW *p) {
 
 void RemoteWebView::draw_rgb565_clipped_(int x, int y, int w, int h, int stride, const uint8_t *pixels,
                                          int clip_x1, int clip_y1, bool big_endian) {
-  int x_off = 0, y_off = 0;
-  if (x < 0) { x_off = -x; w += x; x = 0; }
-  if (y < 0) { y_off = -y; h += y; y = 0; }
-  if (x + w > clip_x1) w = clip_x1 - x;
-  if (y + h > clip_y1) h = clip_y1 - y;
-  if (w <= 0 || h <= 0) return;
+  // (x, y) is where the first source pixel goes; [x0, x1) × [y0, y1) is the visible part.
+  const int x0 = std::max(x, 0), y0 = std::max(y, 0);
+  const int x1 = std::min(x + w, clip_x1), y1 = std::min(y + h, clip_y1);
+  if (x0 >= x1 || y0 >= y1) return;
 
   const int64_t t0 = esp_timer_get_time();
-  display_->draw_pixels_at(x, y, w, h, pixels,
-                           esphome::display::COLOR_ORDER_RGB,
-                           esphome::display::COLOR_BITNESS_565,
-                           big_endian,
-                           x_off, y_off, stride - x_off - w);
+  auto blit = [&](int bx0, int by0, int bx1, int by1) {
+    if (bx0 >= bx1 || by0 >= by1) return;
+    const int src_x = bx0 - x, src_y = by0 - y, bw = bx1 - bx0;
+    display_->draw_pixels_at(bx0, by0, bw, by1 - by0, pixels,
+                             esphome::display::COLOR_ORDER_RGB,
+                             esphome::display::COLOR_BITNESS_565,
+                             big_endian,
+                             src_x, src_y, stride - src_x - bw);
+  };
+
+  // Leave out the overlay: draw the parts above, below, left and right of it.
+  const int ix0 = std::max(x0, ov_x0_), iy0 = std::max(y0, ov_y0_);
+  const int ix1 = std::min(x1, ov_x1_), iy1 = std::min(y1, ov_y1_);
+  if (!ov_active_ || ix0 >= ix1 || iy0 >= iy1) {
+    blit(x0, y0, x1, y1);
+  } else {
+    blit(x0, y0, x1, iy0);
+    blit(x0, iy1, x1, y1);
+    blit(x0, iy0, ix0, iy1);
+    blit(ix1, iy0, x1, iy1);
+  }
   ft_draw_us_ += (uint32_t)(esp_timer_get_time() - t0);
+}
+
+bool RemoteWebView::panel_big_endian_() const {
+#if REMOTE_WEBVIEW_HW_JPEG
+  return this->hw_decode_ ? rgb565::P4_SOFTWARE_JPEG_BIG_ENDIAN : rgb565_big_endian_;
+#else
+  return rgb565_big_endian_;
+#endif
+}
+
+namespace {
+
+// Off-screen canvas for overlays. ESPHome drawing calls use page coordinates; pixels are stored
+// in panel orientation, as the server rotates the page clockwise by `rotation` before sending it.
+class OverlayCanvas : public display::Display {
+ public:
+  OverlayCanvas(int w, int h, int rotation, uint8_t *px, uint8_t *mask, bool big_endian)
+      : w_(w), h_(h), rotation_deg_(rotation), px_(px), mask_(mask), big_endian_(big_endian) {}
+
+  void update() override {}
+  display::DisplayType get_display_type() override { return display::DISPLAY_TYPE_COLOR; }
+
+  void draw_pixel_at(int x, int y, Color color) override {
+    if (x < 0 || y < 0 || x >= w_ || y >= h_) return;
+    int cx, cy, cw;
+    switch (rotation_deg_) {
+      case 90:  cx = h_ - 1 - y; cy = x;          cw = h_; break;
+      case 180: cx = w_ - 1 - x; cy = h_ - 1 - y; cw = w_; break;
+      case 270: cx = y;          cy = w_ - 1 - x; cw = h_; break;
+      default:  cx = x;          cy = y;          cw = w_; break;
+    }
+    const size_t i = (size_t)cy * cw + cx;
+    const uint16_t c = (uint16_t)(((color.r & 0xF8) << 8) | ((color.g & 0xFC) << 3) | (color.b >> 3));
+    const rgb565::PixelBytes b = rgb565::pixel_bytes(c, big_endian_);
+    px_[2 * i] = b.first;
+    px_[2 * i + 1] = b.second;
+    if (!mask_[i]) {
+      mask_[i] = 1;
+      drawn_++;
+    }
+  }
+
+  uint32_t drawn() const { return drawn_; }
+
+ protected:
+  int get_width_internal() override { return w_; }
+  int get_height_internal() override { return h_; }
+
+ private:
+  int w_, h_, rotation_deg_;
+  uint8_t *px_, *mask_;
+  bool big_endian_;
+  uint32_t drawn_{0};
+};
+
+uint8_t *alloc_overlay_mem(size_t n) {
+  auto *p = (uint8_t *)heap_caps_calloc(1, n, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  return p ? p : (uint8_t *)heap_caps_calloc(1, n, MALLOC_CAP_8BIT);
+}
+
+}  // namespace
+
+void RemoteWebView::show_overlay(int x, int y, int w, int h,
+                                 const std::function<void(display::Display &)> &writer) {
+  if (this->is_failed() || !q_decode_ || !state_mtx_ || w <= 0 || h <= 0) return;
+
+  const bool swap = rotation_ == 90 || rotation_ == 270;
+  const int page_w = swap ? display_height_ : display_width_;
+  const int page_h = swap ? display_width_ : display_height_;
+  w = std::min(w, page_w);
+  h = std::min(h, page_h);
+  if (x < 0) x = (page_w - w) / 2;
+  if (y < 0) y = (page_h - h) / 2;
+
+  OverlayBuf b;
+  const size_t n = (size_t)w * (size_t)h;
+  b.px = alloc_overlay_mem(n * 2);
+  b.mask = alloc_overlay_mem(n);
+  if (!b.px || !b.mask) {
+    ESP_LOGE(TAG, "overlay: out of memory for %dx%d", w, h);
+    free_overlay_buf_(b);
+    return;
+  }
+
+  OverlayCanvas canvas(w, h, rotation_, b.px, b.mask, panel_big_endian_());
+  if (writer) writer(canvas);
+  b.drawn = canvas.drawn();
+
+  // Page rect to panel rect, matching the server's clockwise rotation.
+  switch (rotation_) {
+    case 90:  b.x = page_h - (y + h); b.y = x;                b.w = h; b.h = w; break;
+    case 180: b.x = page_w - (x + w); b.y = page_h - (y + h); b.w = w; b.h = h; break;
+    case 270: b.x = y;                b.y = page_w - (x + w); b.w = h; b.h = w; break;
+    default:  b.x = x;                b.y = y;                b.w = w; b.h = h; break;
+  }
+  ESP_LOGD(TAG, "overlay: show %dx%d at %d,%d (%u px drawn)", w, h, x, y, (unsigned)b.drawn);
+  post_overlay_request_(true, b);
+}
+
+void RemoteWebView::hide_overlay() {
+  if (this->is_failed() || !q_decode_ || !state_mtx_) return;
+  ESP_LOGD(TAG, "overlay: hide");
+  post_overlay_request_(false, OverlayBuf{});
+}
+
+void RemoteWebView::post_overlay_request_(bool show, const OverlayBuf &buf) {
+  xSemaphoreTake(state_mtx_, portMAX_DELAY);
+  free_overlay_buf_(ov_req_);  // a request the decode task hasn't picked up yet is superseded
+  ov_req_ = buf;
+  ov_req_show_ = show;
+  ov_req_pending_.store(true, std::memory_order_release);
+  xSemaphoreGive(state_mtx_);
+
+  // Wake the decode task. If the queue is full, it is busy and picks the request up
+  // before it processes the next message.
+  WsMsg wake{};
+  xQueueSendToFront(q_decode_, &wake, 0);
+}
+
+void RemoteWebView::apply_overlay_request_() {
+  if (!ov_req_pending_.load(std::memory_order_acquire)) return;
+
+  xSemaphoreTake(state_mtx_, portMAX_DELAY);
+  OverlayBuf b = ov_req_;
+  const bool show = ov_req_show_;
+  ov_req_ = OverlayBuf{};
+  ov_req_pending_.store(false, std::memory_order_relaxed);
+  xSemaphoreGive(state_mtx_);
+
+  const int x0 = std::max(b.x, 0), y0 = std::max(b.y, 0);
+  const int x1 = std::min(b.x + b.w, display_width_), y1 = std::min(b.y + b.h, display_height_);
+  if (!show || x0 >= x1 || y0 >= y1) {
+    if (ov_active_) {
+      ov_active_ = false;
+      mark_overlay_area_stale_();
+    }
+    free_overlay_buf_(b);
+    return;
+  }
+
+  // The part of the previous overlay that the new one doesn't cover has to be repainted.
+  if (ov_active_ && (ov_x0_ < x0 || ov_y0_ < y0 || ov_x1_ > x1 || ov_y1_ > y1))
+    mark_overlay_area_stale_();
+  ov_active_ = true;
+  ov_x0_ = x0; ov_y0_ = y0; ov_x1_ = x1; ov_y1_ = y1;
+
+  draw_overlay_(b);
+  free_overlay_buf_(b);
+}
+
+void RemoteWebView::draw_overlay_(const OverlayBuf &b) {
+  // Visible part of the overlay, in overlay coordinates.
+  const int cx0 = std::max(0, -b.x), cy0 = std::max(0, -b.y);
+  const int cx1 = std::min(b.w, display_width_ - b.x), cy1 = std::min(b.h, display_height_ - b.y);
+  if (cx0 >= cx1 || cy0 >= cy1 || b.drawn == 0) return;
+
+  const bool be = panel_big_endian_();
+  auto blit = [&](int c0, int r0, int c1, int r1) {
+    display_->draw_pixels_at(b.x + c0, b.y + r0, c1 - c0, r1 - r0, b.px,
+                             esphome::display::COLOR_ORDER_RGB, esphome::display::COLOR_BITNESS_565,
+                             be, c0, r0, b.w - c1);
+  };
+
+  if (b.drawn == (uint32_t)b.w * (uint32_t)b.h) {
+    blit(cx0, cy0, cx1, cy1);  // fully opaque: one transfer
+    return;
+  }
+  // Transparent pixels keep what is on screen: draw each row's opaque runs.
+  for (int r = cy0; r < cy1; r++) {
+    const uint8_t *m = b.mask + (size_t)r * b.w;
+    int c = cx0;
+    while (c < cx1) {
+      while (c < cx1 && !m[c]) c++;
+      const int run0 = c;
+      while (c < cx1 && m[c]) c++;
+      if (c > run0) blit(run0, r, c, r + 1);
+    }
+  }
+}
+
+void RemoteWebView::mark_overlay_area_stale_() {
+  frame_complete_ = false;  // a frame partly left out under the overlay can't repair the screen
+  decode_dirty_.store(true);
+  full_frame_now_.store(true);
+  notify_ws_task_();
+}
+
+void RemoteWebView::free_overlay_buf_(OverlayBuf &b) {
+  free(b.px);
+  free(b.mask);
+  b = OverlayBuf{};
 }
 
 bool RemoteWebView::ws_send_touch_event_(proto::TouchType type, int x, int y, uint8_t pid) {

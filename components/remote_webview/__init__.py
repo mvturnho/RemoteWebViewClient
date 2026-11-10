@@ -7,7 +7,18 @@ from esphome.components import display, touchscreen, text_sensor
 from esphome.components.display import validate_rotation
 from esphome.components import esp32
 from esphome.components.esp32 import add_idf_sdkconfig_option
-from esphome.const import CONF_ID, CONF_DISPLAY_ID, CONF_URL, CONF_ROTATION, CONF_TRIGGER_ID
+from esphome.const import (
+    CONF_DISPLAY_ID,
+    CONF_HEIGHT,
+    CONF_ID,
+    CONF_LAMBDA,
+    CONF_ROTATION,
+    CONF_TRIGGER_ID,
+    CONF_URL,
+    CONF_WIDTH,
+    CONF_X,
+    CONF_Y,
+)
 
 
 CONF_DEVICE_ID = "device_id"
@@ -63,6 +74,9 @@ TriggerOnFrameUpdateAction = ns.class_(
 OnFrameUpdateTrigger = ns.class_(
     "OnFrameUpdateTrigger", automation.Trigger.template()
 )
+
+ShowOverlayAction = ns.class_("ShowOverlayAction", automation.Action)
+HideOverlayAction = ns.class_("HideOverlayAction", automation.Action)
 
 CONFIG_SCHEMA = cv.Schema(
     {
@@ -120,6 +134,57 @@ _SYNC_ACTION_KWARGS = (
 )
 
 async def remote_webview_trigger_on_frame_update_to_code(config, action_id, template_arg, args):
+    paren = await cg.get_variable(config[CONF_ID])
+    return cg.new_Pvariable(action_id, template_arg, paren)
+
+
+SHOW_OVERLAY_SCHEMA = cv.Schema(
+    {
+        cv.GenerateID(): cv.use_id(RemoteWebView),
+        cv.Required(CONF_WIDTH): cv.positive_not_null_int,
+        cv.Required(CONF_HEIGHT): cv.positive_not_null_int,
+        # Top-left corner in page coordinates; centered on an axis when omitted.
+        cv.Optional(CONF_X): cv.int_range(min=0),
+        cv.Optional(CONF_Y): cv.int_range(min=0),
+        cv.Required(CONF_LAMBDA): cv.lambda_,
+    }
+)
+
+
+@automation.register_action(
+    "remote_webview.show_overlay",
+    ShowOverlayAction,
+    SHOW_OVERLAY_SCHEMA,
+    **_SYNC_ACTION_KWARGS,
+)
+async def remote_webview_show_overlay_to_code(config, action_id, template_arg, args):
+    paren = await cg.get_variable(config[CONF_ID])
+    var = cg.new_Pvariable(action_id, template_arg, paren)
+    cg.add(
+        var.set_rect(
+            config.get(CONF_X, -1),
+            config.get(CONF_Y, -1),
+            config[CONF_WIDTH],
+            config[CONF_HEIGHT],
+        )
+    )
+    writer = await cg.process_lambda(
+        config[CONF_LAMBDA], [(display.DisplayRef, "it"), *args], return_type=cg.void
+    )
+    cg.add(var.set_writer(writer))
+    return var
+
+
+@automation.register_action(
+    "remote_webview.hide_overlay",
+    HideOverlayAction,
+    cv.maybe_simple_value(
+        {cv.GenerateID(): cv.use_id(RemoteWebView)},
+        key=CONF_ID,
+    ),
+    **_SYNC_ACTION_KWARGS,
+)
+async def remote_webview_hide_overlay_to_code(config, action_id, template_arg, args):
     paren = await cg.get_variable(config[CONF_ID])
     return cg.new_Pvariable(action_id, template_arg, paren)
 

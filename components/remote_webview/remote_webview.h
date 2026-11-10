@@ -62,6 +62,14 @@ class RemoteWebView : public Component {
   void add_on_frame_update_callback(std::function<void()> &&callback);
   void trigger_on_frame_update();
 
+  // Overlay ("popup") drawn on the device over the web view. Main loop only.
+  // `writer` draws on a w×h canvas in display pixels, in the page's orientation (rotation is
+  // applied for you); pixels it doesn't draw stay transparent. x/y is the top-left corner in the
+  // same coordinates, -1 centers the overlay on that axis. While an overlay is shown, tiles under it are not drawn; hiding it (or
+  // replacing it with one that doesn't cover it) requests a full frame to repaint that area.
+  void show_overlay(int x, int y, int w, int h, const std::function<void(display::Display &)> &writer);
+  void hide_overlay();
+
   void setup() override;
   void loop() override;
   void dump_config() override;
@@ -92,6 +100,13 @@ class RemoteWebView : public Component {
     uint32_t touches{0}, touches_no_frame{0};
     uint64_t touch_first_us{0}, touch_largest_us{0};
     uint32_t touch_first_max_us{0}, touch_largest_max_us{0};
+  };
+  // A rendered overlay, in panel orientation and the panel's RGB565 byte order.
+  struct OverlayBuf {
+    uint8_t *px{nullptr};    // w*h RGB565 pixels
+    uint8_t *mask{nullptr};  // w*h, non-zero where the writer drew
+    int x{0}, y{0}, w{0}, h{0};  // rect on the panel, may extend past the display
+    uint32_t drawn{0};       // number of non-zero mask entries
   };
 
   CallbackManager<void()> on_frame_update_callback_{};
@@ -152,12 +167,15 @@ class RemoteWebView : public Component {
   size_t   frame_bytes_{0};
 
   // Screen sync tracking. The screen is out of sync when a message was lost on receive
-  // (rx_loss_seq_ != repaired_loss_seq_) or a tile failed to decode (decode_dirty_).
-  // It is repaired by a full frame that arrived and decoded without any loss.
+  // (rx_loss_seq_ != repaired_loss_seq_), a tile failed to decode, or an overlay was hidden
+  // (decode_dirty_). It is repaired by a full frame that arrived and decoded without any loss.
   std::atomic<uint32_t> rx_loss_seq_{0};        // written by the WS client task
   std::atomic<uint32_t> repaired_loss_seq_{0};  // written by the decode task
   std::atomic<bool>     decode_dirty_{false};   // written by the decode task
   std::atomic<int64_t>  last_full_frame_req_us_{0};
+  // Set by the decode task when an overlay is hidden: rwv_ws requests a full frame without
+  // waiting for full_frame_request_interval_us.
+  std::atomic<bool>     full_frame_now_{false};
   // decode task only
   uint32_t msg_loss_seq_{0};       // stamp of the message being processed
   uint32_t prev_msg_loss_seq_{0};  // stamp of the previously processed message
@@ -210,6 +228,15 @@ class RemoteWebView : public Component {
   std::string pending_url_{};
   SemaphoreHandle_t state_mtx_{nullptr};
 
+  // Overlay request from the main loop to the decode task; ov_req_ and ov_req_show_ are
+  // guarded by state_mtx_. An unapplied request is replaced by a newer one.
+  std::atomic<bool> ov_req_pending_{false};
+  bool ov_req_show_{false};
+  OverlayBuf ov_req_{};
+  // Overlay rect on the panel, clipped to the display; tiles are not drawn inside it (decode task only).
+  bool ov_active_{false};
+  int ov_x0_{0}, ov_y0_{0}, ov_x1_{0}, ov_y1_{0};
+
   uint32_t last_trigger_ms_{0};
   text_sensor::TextSensor *url_sensor_{nullptr};
 
@@ -231,9 +258,17 @@ class RemoteWebView : public Component {
   static int jpeg_draw_cb_s_(JPEGDRAW *p);
   int jpeg_draw_cb_(JPEGDRAW *p);
   // Draws a w×h RGB565 region whose source rows are `stride` pixels apart, clipped to
-  // [0, clip_x1) × [0, clip_y1).
+  // [0, clip_x1) × [0, clip_y1) and leaving out the active overlay.
   void draw_rgb565_clipped_(int x, int y, int w, int h, int stride, const uint8_t *pixels,
                             int clip_x1, int clip_y1, bool big_endian);
+  // RGB565 byte order of the pixels sent to the display (software JPEG output and overlays).
+  bool panel_big_endian_() const;
+
+  void post_overlay_request_(bool show, const OverlayBuf &buf);  // main loop
+  void apply_overlay_request_();                                 // decode task
+  void draw_overlay_(const OverlayBuf &buf);                     // decode task
+  void mark_overlay_area_stale_();                               // decode task
+  static void free_overlay_buf_(OverlayBuf &buf);
   JPEGDEC jd_;
   int sw_clip_x1_{0};  // clip bounds of the tile being decoded in software (decode task only)
   int sw_clip_y1_{0};

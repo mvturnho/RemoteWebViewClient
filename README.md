@@ -221,8 +221,48 @@ text:
 - **hw_decode** — ESP32-P4 only; defaults to **true**. Set to `false` to use the software JPEG decoder. Only tiles whose width is a whole number of the hardware decoder's 2D-DMA output blocks (48 px for the server's 4:2:0 JPEGs, 64 px for 4:2:2, 32 px for 4:4:4) are decoded in hardware. Other tiles are decoded in software, because in hardware a narrower tile times out after `hw_decode_timeout_ms` and a tile with a partial last block shows grey blocks. Set `tile_size: 48` so every tile qualifies; with the default `32`, only tiles 96, 192, 288, … px wide do.
 - **hw_decode_timeout_ms** — ESP32-P4 only; defaults to **200**. Timeout passed to the hardware JPEG decoder engine.
 - **Hardware JPEG diagnostics** — enable `hw_decode_diagnostics` for timeout metadata. Add `hw_decode_driver_debug` only for a short diagnostic run and use DEBUG logging; a `jpeg.decoder: 2ddma transaction callbacks start` line proves that DMA2D picked up the transaction. The IDF driver warns that this debug mode makes JPEG processing substantially slower.
-- **Display ownership** — `remote_webview` draws from its own task, so nothing else may draw to the same display: use `update_interval: never`, no `lambda`/`pages`, `auto_clear_enabled: false`, `show_test_card: false`, and don't call `component.update` on it. Prefer a touchscreen on a separate bus (e.g. I2C) rather than sharing the display's SPI bus.
+- **Display ownership** — `remote_webview` draws from its own task, so nothing else may draw to the same display: use `update_interval: never`, no `lambda`/`pages`, `auto_clear_enabled: false`, `show_test_card: false`, and don't call `component.update` on it. To draw something on the device itself, use an [overlay](#overlay-popup). Prefer a touchscreen on a separate bus (e.g. I2C) rather than sharing the display's SPI bus.
 - **Red tile / red screen** — this indicates a tile payload exceeded `max_bytes_per_msg`. Increase `max_bytes_per_msg` or reduce tile size/JPEG quality so each tile fits.
+
+## Overlay (popup)
+
+An overlay is a popup drawn by the device itself over the web view, without a round trip to the server. Use it for feedback that must appear right away, such as "listening" for a voice assistant.
+
+```yaml
+font:
+  - file: "gfonts://Roboto"
+    id: font_popup
+    size: 28
+
+image:
+  - file: mdi:microphone
+    id: icon_mic
+    resize: 48x48
+    type: BINARY
+    transparency: chroma_key
+
+voice_assistant:
+  # ...
+  on_listening:
+    - remote_webview.show_overlay:
+        id: rwv
+        width: 320
+        height: 96
+        y: 40            # omit x and/or y to center the overlay on that axis
+        lambda: |-
+          it.fill(Color(30, 30, 30));
+          it.filled_circle(48, 48, 32, Color(3, 169, 244));
+          it.image(24, 24, id(icon_mic), Color(255, 255, 255));
+          it.print(100, 48, id(font_popup), Color(255, 255, 255), TextAlign::CENTER_LEFT, "Listening...");
+  on_end:
+    - remote_webview.hide_overlay: rwv
+```
+
+- `remote_webview.show_overlay` draws `lambda` on a `width` × `height` canvas with the usual ESPHome display calls (`it.print`, `it.image`, `it.filled_rectangle`, …). The lambda also gets the trigger's arguments, so `on_stt_end` can show the recognized text with `x.c_str()`. Coordinates are display pixels in the page's orientation (`rotation` is applied for you, `scale` is not).
+- Pixels the lambda doesn't draw stay transparent and keep what was on screen when the overlay appeared. Only fully drawn or untouched pixels exist: there is no partial transparency.
+- While an overlay is shown, tiles under its rectangle are not drawn. `remote_webview.hide_overlay` (or showing a new overlay that doesn't cover the old one) requests a full frame from the server to repaint the area.
+- `show_overlay` replaces the current overlay. From a lambda: `id(rwv).show_overlay(x, y, w, h, [](display::Display &it) { ... })` and `id(rwv).hide_overlay()`, with `-1` for a centered axis.
+- The canvas is rendered in the main loop and drawn by the `remote_webview` task. It uses `width × height × 3` bytes of PSRAM until it is drawn.
 
 ## On-screen keyboard
 
